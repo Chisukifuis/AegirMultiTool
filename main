@@ -1,0 +1,599 @@
+<##
+    This PowerShell script implements **Aegir Multi Tool**, a menuâ€‘driven
+    utility that can be launched directly from the internet using the
+    Invokeâ€‘RestMethod (IRM) mechanism: ``irm <url> | iex``.  The script
+    presents a topâ€‘level menu with different tabs.  The first implemented
+    tab is the **Download** menu, which lists popular applications and
+    installs them using WinGet, Chocolatey or direct download as needed.
+    Each entry in the download menu is associated with its package
+    identifier to ensure robust, futureâ€‘proof installations.  The tool
+    selfâ€‘elevates if necessary, verifies that WinGet is present, and
+    orchestrates silent installations.  A language selection page allows
+    users to choose between French, English, Italian, German, Spanish,
+    Arabic, Russian, Japanese and Mandarin Chinese; all menu labels and
+    prompts are translated accordingly.
+##>
+
+function Test-Administrator {
+    <#
+        Determines whether the current PowerShell session is running with
+        administrative privileges.  Returns ``$true`` if the user is an
+        administrator and ``$false`` otherwise.
+    #>
+    try {
+        $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+function Self-Elevate {
+    <#
+        If the current process is not running with administrative
+        privileges, relaunches the script in a new elevated PowerShell
+        instance and then terminates the current instance.  This ensures
+        that subsequent calls to WinGet and installers can run silently
+        without prompting for permissions.
+    #>
+    param(
+        [string]$ScriptPath
+    )
+    if (-not (Test-Administrator)) {
+        Write-Host "[+] L'outil nÃ©cessite des privilÃ¨ges administratifs. RedÃ©marrage en mode administrateurâ€¦" -ForegroundColor Yellow
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'powershell'
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"$ScriptPath\""
+        $psi.Verb = 'runas'
+        try {
+            [System.Diagnostics.Process]::Start($psi) | Out-Null
+        } catch {
+            Write-Error "Impossible de lancer une session administrateur. ExÃ©cution annulÃ©e."
+        }
+        Exit
+    }
+}
+
+function Ensure-WinGet {
+    <#
+        Verifies that the ``winget`` command is available on the system.
+        If WinGet is not found, instructs the user how to install it and
+        returns ``$false``.  Otherwise returns ``$true``.
+    #>
+    if (-not (Get-Command "winget" -ErrorAction SilentlyContinue)) {
+        Write-Host "[!] WinGet n'est pas installÃ© ou n'est pas accessible." -ForegroundColor Yellow
+        Write-Host "    Veuillez installer l'application 'App Installer' depuis le Microsoft Store ou" -ForegroundColor Yellow
+        Write-Host "    consulter la documentation officielle pour installer WinGet: https://learn.microsoft.com/windows/package-manager/winget/install" -ForegroundColor Yellow
+        return $false
+    }
+    return $true
+}
+
+#region Chocolatey Support
+function Ensure-Chocolatey {
+    <#
+        Checks if the Chocolatey package manager (`choco`) is installed and
+        available in the PATH.  If Chocolatey is not present, this
+        function will attempt to install it by executing the official
+        installation script provided by the Chocolatey community
+        repository.  According to the Petri IT Knowledgebase, installing
+        Chocolatey requires running a PowerShell script downloaded from
+        https://chocolatey.org/install.ps1 with an execution policy
+        override and network security protocol adjustmentsã€400953405515457â€ L88-L112ã€‘.
+        Once Chocolatey is installed you can install packages by running
+        `choco install <package>`ã€400953405515457â€ L88-L112ã€‘.  This function
+        returns `$true` if Chocolatey is installed or successfully
+        installed, otherwise `$false`.
+    #>
+    if (Get-Command "choco" -ErrorAction SilentlyContinue) {
+        return $true
+    }
+    Write-Host "[!] Chocolatey n'est pas installÃ©. Installation en coursâ€¦" -ForegroundColor Yellow
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+        $installCmd = "iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))"
+        $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$installCmd)
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = 'powershell'
+        $processInfo.Arguments = $arguments -join ' '
+        $processInfo.Verb = 'runas'
+        $processInfo.UseShellExecute = $true
+        $proc = [System.Diagnostics.Process]::Start($processInfo)
+        $proc.WaitForExit()
+        if (Get-Command "choco" -ErrorAction SilentlyContinue) {
+            Write-Host "[âœ“] Chocolatey installÃ©." -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host "[X] L'installation de Chocolatey a Ã©chouÃ©." -ForegroundColor Red
+            return $false
+        }
+    } catch {
+        Write-Host "[X] Exception lors de l'installation de Chocolatey: $_" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Install-ChocoPackage {
+    <#
+        Installs a package via Chocolatey.  Accepts a package name (ID)
+        and a humanâ€‘readable display name.  Chocolatey must already be
+        installed; otherwise this function will attempt to install it.
+        Uses the `-y` switch to accept any prompts automatically, as
+        recommended in examples from the Petri articleã€400953405515457â€ L88-L112ã€‘.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$Id,
+        [Parameter(Mandatory)] [string]$Name
+    )
+    if (-not (Ensure-Chocolatey)) {
+        Write-Host "[X] Impossible d'installer $Name via Chocolatey: Chocolatey introuvable." -ForegroundColor Red
+        return
+    }
+    Write-Host "\n[+] Installation de $Name via Chocolateyâ€¦" -ForegroundColor Cyan
+    try {
+        $arguments = @('install', $Id, '-y')
+        $process = Start-Process -FilePath 'choco' -ArgumentList $arguments -Wait -PassThru -NoNewWindow -ErrorAction SilentlyContinue
+        if ($process -and $process.ExitCode -eq 0) {
+            Write-Host "[âœ“] $Name installÃ© via Chocolatey." -ForegroundColor Green
+        } else {
+            Write-Host "[X] Ã‰chec de l'installation de $Name via Chocolatey." -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "[X] Exception pendant l'installation de $Name via Chocolatey: $_" -ForegroundColor Red
+    }
+}
+
+function Install-ManualPackage {
+    <#
+        Handles installation of software that is not available via WinGet or
+        Chocolatey.  Downloads the installer from a provided URL and then
+        executes or extracts it depending on the file type.  For zip
+        archives, the archive is extracted into `C:\Program Files\<Name>`
+        using the builtâ€‘in .NET zip functions.  For executable installers,
+        the installer is run with `/S` for silent installation, but GUI
+        prompts may still appear if the installer does not support silent
+        options.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [string]$Url,
+        [Parameter(Mandatory)] [ValidateSet('exe','zip')] [string]$FileType
+    )
+    try {
+        Write-Host "\n[+] TÃ©lÃ©chargement de $Nameâ€¦" -ForegroundColor Cyan
+        $tempFile = Join-Path $env:TEMP ("$Name.$FileType")
+        Invoke-WebRequest -Uri $Url -OutFile $tempFile -UseBasicParsing -ErrorAction Stop
+        Write-Host "[+] Fichier tÃ©lÃ©chargÃ©: $tempFile" -ForegroundColor Cyan
+        if ($FileType -eq 'zip') {
+            $dest = Join-Path 'C:\Program Files' $Name
+            if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($tempFile, $dest)
+            Write-Host "[âœ“] Archive extraite dans $dest" -ForegroundColor Green
+        } elseif ($FileType -eq 'exe') {
+            Write-Host "[+] ExÃ©cution de l'installateur $Nameâ€¦" -ForegroundColor Cyan
+            $proc = Start-Process -FilePath $tempFile -ArgumentList '/S' -PassThru -Wait -ErrorAction SilentlyContinue
+            if ($proc -and $proc.ExitCode -eq 0) {
+                Write-Host "[âœ“] $Name installÃ©." -ForegroundColor Green
+            } else {
+                Write-Host "[!] L'installateur de $Name s'est terminÃ© avec le code $($proc.ExitCode)." -ForegroundColor Yellow
+            }
+        }
+    } catch {
+        Write-Host "[X] Ã‰chec lors de l'installation manuelle de $Name: $_" -ForegroundColor Red
+    }
+}
+#endregion Chocolatey Support
+
+function Install-Package {
+    <#
+        Installs a software package using WinGet.  Accepts a package
+        identifier (corresponding to the ``--id`` parameter in WinGet)
+        and installs it silently with license agreements accepted.  Uses
+        the recommended options `--id` and `-e` to ensure unambiguous
+        installationsã€328272801817266â€ L301-L308ã€‘ã€328272801817266â€ L358-L359ã€‘.  Displays status
+        messages before and after installation.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$Id,
+        [Parameter(Mandatory)] [string]$Name
+    )
+    Write-Host "\n[+] Installation de: $Name" -ForegroundColor Cyan
+    try {
+        $arguments = @('install','--id',$Id,'-e','--silent','--accept-package-agreements','--accept-source-agreements')
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = 'winget'
+        $processInfo.Arguments = $arguments -join ' '
+        $processInfo.UseShellExecute = $false
+        $processInfo.RedirectStandardOutput = $true
+        $processInfo.RedirectStandardError = $true
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $processInfo
+        $process.Start() | Out-Null
+        $process.WaitForExit()
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        if ($process.ExitCode -eq 0) {
+            Write-Host "[âœ“] $Name installÃ© avec succÃ¨s." -ForegroundColor Green
+        } else {
+            Write-Host "[X] Ã‰chec lors de l'installation de $Name. Code de sortie: $($process.ExitCode)" -ForegroundColor Red
+            if ($stderr) {
+                Write-Host "--- Erreur ---" -ForegroundColor Red
+                Write-Host $stderr -ForegroundColor Red
+            }
+        }
+    } catch {
+        Write-Host "[X] Exception pendant l'installation de $Name: $_" -ForegroundColor Red
+    }
+}
+
+function Get-MultiSelection {
+    <#
+        Prompts the user to select one or more items from a menu by entering
+        numbers separated by semicolons (e.g. "1;3;5").  Returns an array
+        of integers corresponding to the selected indices.  If the user
+        enters 0, the returned array will contain only 0 to indicate
+        returning to the previous menu.  A custom prompt string can be
+        supplied; otherwise a default French prompt is used.
+    #>
+    param(
+        [Parameter(Mandatory)] [array]$Items,
+        [string]$Prompt
+    )
+    while ($true) {
+        $message = $Prompt
+        if (-not $message) { $message = "Entrez le(s) numÃ©ro(s) (sÃ©parÃ©s par ';') ou 0 pour revenir" }
+        $input = Read-Host -Prompt $message
+        $parts = $input -split ';'
+        $numbers = @()
+        foreach ($part in $parts) {
+            $trimmed = $part.Trim()
+            if ($trimmed -match '^[0-9]+$') {
+                $num = [int]$trimmed
+                $numbers += $num
+            }
+        }
+        if ($numbers.Count -gt 0) { return $numbers }
+        if ($Global:Text -and $Global:Text.ContainsKey('InvalidSelection')) {
+            Write-Host $Global:Text['InvalidSelection'] -ForegroundColor Yellow
+        } else {
+            Write-Host "EntrÃ©e non valide. Veuillez entrer des chiffres sÃ©parÃ©s par ';'." -ForegroundColor Yellow
+        }
+    }
+}
+
+function Get-UserSelection {
+    <#
+        Obtains the user's selection from a menu.  If the menu contains
+        more than nine items, the user must type the number and press
+        Enter.  If there are nine items or fewer, a single key press is
+        sufficient (no Enter required).  Returns the integer index
+        selected or ``$null`` on invalid input.
+    #>
+    param(
+        [Parameter(Mandatory)] [array]$Items
+    )
+    if ($Items.Count -le 9) {
+        do {
+            $keyInfo = [System.Console]::ReadKey($true)
+            $keyChar = $keyInfo.KeyChar
+        } while (-not ($keyChar -match '^[0-9]$'))
+        return [int]$keyChar.ToString()
+    } else {
+        $input = Read-Host "Entrez le numÃ©ro correspondant et appuyez sur EntrÃ©e"
+        if ($input -match '^[0-9]+$') { return [int]$input } else { return $null }
+    }
+}
+
+# Translation dictionary and language selection
+$Global:Translations = @{
+    'fr' = @{
+        DownloadMenuTitle = 'MENU DES TÃ‰LÃ‰CHARGEMENTS'
+        Welcome          = 'Bienvenue dans Aegir Multi Tool'
+        SelectTab        = 'SÃ©lectionnez un onglet :'
+        Downloads        = 'TÃ©lÃ©chargements'
+        Quit             = 'Quitter'
+        EnterNumbers     = "Entrez le(s) numÃ©ro(s) (sÃ©parÃ©s par ';') ou 0 pour revenir"
+        SelectMultiple   = 'Vous pouvez sÃ©lectionner plusieurs applications Ã  installer.'
+        InstallComplete  = "Installation(s) terminÃ©e(s). Appuyez sur une touche pour continuerâ€¦"
+        Back             = 'Retour'
+        Goodbye          = 'Au revoir !'
+        InvalidSelection = "EntrÃ©e non valide. Veuillez entrer des chiffres sÃ©parÃ©s par ';'."
+        InvalidOption    = 'Option invalide. Essayez de nouveau.'
+    }
+    'en' = @{
+        DownloadMenuTitle = 'DOWNLOADS MENU'
+        Welcome          = 'Welcome to Aegir Multi Tool'
+        SelectTab        = 'Select a tab:'
+        Downloads        = 'Downloads'
+        Quit             = 'Quit'
+        EnterNumbers     = "Enter number(s) separated by ';' or 0 to return"
+        SelectMultiple   = 'You can select multiple applications to install.'
+        InstallComplete  = 'Installation(s) complete. Press any key to continueâ€¦'
+        Back             = 'Back'
+        Goodbye          = 'Goodbye!'
+        InvalidSelection = "Invalid input. Please enter numbers separated by ';'."
+        InvalidOption    = 'Invalid option. Please try again.'
+    }
+    'it' = @{
+        DownloadMenuTitle = 'MENU DEI DOWNLOAD'
+        Welcome          = 'Benvenuto in Aegir Multi Tool'
+        SelectTab        = 'Seleziona una scheda:'
+        Downloads        = 'Download'
+        Quit             = 'Esci'
+        EnterNumbers     = "Inserisci i numeri separati da ';' o 0 per tornare"
+        SelectMultiple   = 'Puoi selezionare piÃ¹ applicazioni da installare.'
+        InstallComplete  = 'Installazione/i completata/e. Premi un tasto per continuareâ€¦'
+        Back             = 'Indietro'
+        Goodbye          = 'Arrivederci!'
+        InvalidSelection = "Inserimento non valido. Inserisci i numeri separati da ';'."
+        InvalidOption    = 'Opzione non valida. Riprova.'
+    }
+    'de' = @{
+        DownloadMenuTitle = 'DOWNLOAD-MENÃœ'
+        Welcome          = 'Willkommen im Aegir Multi Tool'
+        SelectTab        = 'WÃ¤hlen Sie einen Reiter:'
+        Downloads        = 'Downloads'
+        Quit             = 'Beenden'
+        EnterNumbers     = "Geben Sie die Nummer(n) ein (mit ';' getrennt) oder 0 zum ZurÃ¼ckkehren"
+        SelectMultiple   = 'Sie kÃ¶nnen mehrere Anwendungen zur Installation auswÃ¤hlen.'
+        InstallComplete  = 'Installation(en) abgeschlossen. DrÃ¼cken Sie eine Taste, um fortzufahrenâ€¦'
+        Back             = 'ZurÃ¼ck'
+        Goodbye          = 'Auf Wiedersehen!'
+        InvalidSelection = "UngÃ¼ltige Eingabe. Bitte geben Sie Zahlen ein, getrennt durch ';'."
+        InvalidOption    = 'UngÃ¼ltige Option. Bitte versuchen Sie es erneut.'
+    }
+    'es' = @{
+        DownloadMenuTitle = 'MENÃš DE DESCARGAS'
+        Welcome          = 'Bienvenido a Aegir Multi Tool'
+        SelectTab        = 'Seleccione una pestaÃ±a:'
+        Downloads        = 'Descargas'
+        Quit             = 'Salir'
+        EnterNumbers     = "Introduzca los nÃºmeros separados por ';' o 0 para volver"
+        SelectMultiple   = 'Puede seleccionar varias aplicaciones para instalar.'
+        InstallComplete  = 'InstalaciÃ³n(es) completada(s). Pulse cualquier tecla para continuarâ€¦'
+        Back             = 'Volver'
+        Goodbye          = 'Â¡AdiÃ³s!'
+        InvalidSelection = "Entrada no vÃ¡lida. Introduzca nÃºmeros separados por ';'."
+        InvalidOption    = 'OpciÃ³n no vÃ¡lida. Vuelva a intentarlo.'
+    }
+    'ar' = @{
+        DownloadMenuTitle = 'Ù‚Ø§Ø¦Ù…Ø© Ø§Ù„ØªÙ†Ø²ÙŠÙ„Ø§Øª'
+        Welcome          = 'Ù…Ø±Ø­Ø¨Ø§Ù‹ Ø¨Ùƒ ÙÙŠ Aegir Multi Tool'
+        SelectTab        = 'Ø§Ø®ØªØ± ØªØ¨ÙˆÙŠØ¨Ø§Ù‹:'
+        Downloads        = 'Ø§Ù„ØªÙ†Ø²ÙŠÙ„Ø§Øª'
+        Quit             = 'Ø¥Ù†Ù‡Ø§Ø¡'
+        EnterNumbers     = "Ø£Ø¯Ø®Ù„ Ø§Ù„Ø£Ø±Ù‚Ø§Ù… Ù…ÙØµÙˆÙ„Ø© Ø¨Ù€ ';' Ø£Ùˆ 0 Ù„Ù„Ø¹ÙˆØ¯Ø©"
+        SelectMultiple   = 'ÙŠÙ…ÙƒÙ†Ùƒ Ø§Ø®ØªÙŠØ§Ø± Ø¹Ø¯Ø© ØªØ·Ø¨ÙŠÙ‚Ø§Øª Ù„Ù„ØªØ«Ø¨ÙŠØª.'
+        InstallComplete  = 'ØªÙ… Ø§ÙƒØªÙ…Ø§Ù„ Ø§Ù„ØªØ«Ø¨ÙŠØª. Ø§Ø¶ØºØ· Ø£ÙŠ Ù…ÙØªØ§Ø­ Ù„Ù„Ù…ØªØ§Ø¨Ø¹Ø©â€¦'
+        Back             = 'Ø±Ø¬ÙˆØ¹'
+        Goodbye          = 'Ù…Ø¹ Ø§Ù„Ø³Ù„Ø§Ù…Ø©!'
+        InvalidSelection = "Ø¥Ø¯Ø®Ø§Ù„ ØºÙŠØ± ØµØ§Ù„Ø­. ÙŠØ±Ø¬Ù‰ Ø¥Ø¯Ø®Ø§Ù„ Ø£Ø±Ù‚Ø§Ù… Ù…ÙØµÙˆÙ„Ø© Ø¨Ù€ ';'."
+        InvalidOption    = 'Ø®ÙŠØ§Ø± ØºÙŠØ± ØµØ§Ù„Ø­. Ø­Ø§ÙˆÙ„ Ù…Ø±Ø© Ø£Ø®Ø±Ù‰.'
+    }
+    'ru' = @{
+        DownloadMenuTitle = 'ÐœÐ•ÐÐ® Ð—ÐÐ“Ð Ð£Ð—ÐžÐš'
+        Welcome          = 'Ð”Ð¾Ð±Ñ€Ð¾ Ð¿Ð¾Ð¶Ð°Ð»Ð¾Ð²Ð°Ñ‚ÑŒ Ð² Aegir Multi Tool'
+        SelectTab        = 'Ð’Ñ‹Ð±ÐµÑ€Ð¸Ñ‚Ðµ Ð²ÐºÐ»Ð°Ð´ÐºÑƒ:'
+        Downloads        = 'Ð—Ð°Ð³Ñ€ÑƒÐ·ÐºÐ¸'
+        Quit             = 'Ð’Ñ‹Ñ…Ð¾Ð´'
+        EnterNumbers     = "Ð’Ð²ÐµÐ´Ð¸Ñ‚Ðµ Ð½Ð¾Ð¼ÐµÑ€(Ð°), Ñ€Ð°Ð·Ð´ÐµÐ»Ñ‘Ð½Ð½Ñ‹Ðµ ';', Ð¸Ð»Ð¸ 0 Ð´Ð»Ñ Ð²Ð¾Ð·Ð²Ñ€Ð°Ñ‚Ð°"
+        SelectMultiple   = 'Ð’Ñ‹ Ð¼Ð¾Ð¶ÐµÑ‚Ðµ Ð²Ñ‹Ð±Ñ€Ð°Ñ‚ÑŒ Ð½ÐµÑÐºÐ¾Ð»ÑŒÐºÐ¾ Ð¿Ñ€Ð¸Ð»Ð¾Ð¶ÐµÐ½Ð¸Ð¹ Ð´Ð»Ñ ÑƒÑÑ‚Ð°Ð½Ð¾Ð²ÐºÐ¸.'
+        InstallComplete  = 'Ð£ÑÑ‚Ð°Ð½Ð¾Ð²ÐºÐ°(Ñ‹) Ð·Ð°Ð²ÐµÑ€ÑˆÐµÐ½Ð°(Ñ‹). ÐÐ°Ð¶Ð¼Ð¸Ñ‚Ðµ Ð»ÑŽÐ±ÑƒÑŽ ÐºÐ»Ð°Ð²Ð¸ÑˆÑƒ, Ñ‡Ñ‚Ð¾Ð±Ñ‹ Ð¿Ñ€Ð¾Ð´Ð¾Ð»Ð¶Ð¸Ñ‚ÑŒâ€¦'
+        Back             = 'ÐÐ°Ð·Ð°Ð´'
+        Goodbye          = 'Ð”Ð¾ ÑÐ²Ð¸Ð´Ð°Ð½Ð¸Ñ!'
+        InvalidSelection = "ÐÐµÐ²ÐµÑ€Ð½Ñ‹Ð¹ Ð²Ð²Ð¾Ð´. ÐŸÐ¾Ð¶Ð°Ð»ÑƒÐ¹ÑÑ‚Ð°, Ð²Ð²ÐµÐ´Ð¸Ñ‚Ðµ Ñ‡Ð¸ÑÐ»Ð°, Ñ€Ð°Ð·Ð´ÐµÐ»Ñ‘Ð½Ð½Ñ‹Ðµ ';'."
+        InvalidOption    = 'ÐÐµÐ²ÐµÑ€Ð½Ñ‹Ð¹ Ð²Ð°Ñ€Ð¸Ð°Ð½Ñ‚. ÐŸÐ¾Ð¿Ñ€Ð¾Ð±ÑƒÐ¹Ñ‚Ðµ ÑÐ½Ð¾Ð²Ð°.'
+    }
+    'ja' = @{
+        DownloadMenuTitle = 'ãƒ€ã‚¦ãƒ³ãƒ­ãƒ¼ãƒ‰ãƒ¡ãƒ‹ãƒ¥ãƒ¼'
+        Welcome          = 'Aegir Multi Tool ã¸ã‚ˆã†ã“ã'
+        SelectTab        = 'ã‚¿ãƒ–ã‚’é¸æŠžã—ã¦ãã ã•ã„:'
+        Downloads        = 'ãƒ€ã‚¦ãƒ³ãƒ­ãƒ¼ãƒ‰'
+        Quit             = 'çµ‚äº†'
+        EnterNumbers     = "ç•ªå·ã‚’ã‚»ãƒŸã‚³ãƒ­ãƒ³ ';' ã§åŒºåˆ‡ã£ã¦å…¥åŠ›ã™ã‚‹ã‹ã€0ã§æˆ»ã‚Šã¾ã™"
+        SelectMultiple   = 'è¤‡æ•°ã®ã‚¢ãƒ—ãƒªã‚±ãƒ¼ã‚·ãƒ§ãƒ³ã‚’é¸æŠžã—ã¦ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã§ãã¾ã™ã€‚'
+        InstallComplete  = 'ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ãŒå®Œäº†ã—ã¾ã—ãŸã€‚ç¶šè¡Œã™ã‚‹ã«ã¯ä»»æ„ã®ã‚­ãƒ¼ã‚’æŠ¼ã—ã¦ãã ã•ã„â€¦'
+        Back             = 'æˆ»ã‚‹'
+        Goodbye          = 'ã•ã‚ˆã†ãªã‚‰ï¼'
+        InvalidSelection = "ç„¡åŠ¹ãªå…¥åŠ›ã§ã™ã€‚æ•°å­—ã‚’ã‚»ãƒŸã‚³ãƒ­ãƒ³ ';' ã§åŒºåˆ‡ã£ã¦å…¥åŠ›ã—ã¦ãã ã•ã„ã€‚"
+        InvalidOption    = 'ç„¡åŠ¹ãªé¸æŠžã§ã™ã€‚ã‚‚ã†ä¸€åº¦ã‚„ã‚Šç›´ã—ã¦ãã ã•ã„ã€‚'
+    }
+    'zh' = @{
+        DownloadMenuTitle = 'ä¸‹è½½èœå•'
+        Welcome          = 'æ¬¢è¿Žä½¿ç”¨ Aegir Multi Tool'
+        SelectTab        = 'è¯·é€‰æ‹©ä¸€ä¸ªé€‰é¡¹å¡:'
+        Downloads        = 'ä¸‹è½½'
+        Quit             = 'é€€å‡º'
+        EnterNumbers     = "è¾“å…¥ç¼–å·ï¼Œç”¨ ';' åˆ†éš”ï¼Œæˆ–è¾“å…¥ 0 è¿”å›ž"
+        SelectMultiple   = 'æ‚¨å¯ä»¥é€‰æ‹©å¤šä¸ªåº”ç”¨ç¨‹åºè¿›è¡Œå®‰è£…ã€‚'
+        InstallComplete  = 'å®‰è£…å®Œæˆã€‚æŒ‰ä»»æ„é”®ç»§ç»­â€¦'
+        Back             = 'è¿”å›ž'
+        Goodbye          = 'å†è§ï¼'
+        InvalidSelection = "è¾“å…¥æ— æ•ˆã€‚è¯·è¾“å…¥ç”¨ ';' åˆ†éš”çš„æ•°å­—ã€‚"
+        InvalidOption    = 'æ— æ•ˆçš„é€‰é¡¹ã€‚è¯·å†è¯•ä¸€æ¬¡ã€‚'
+    }
+}
+
+function Show-LanguageMenu {
+    <#
+        Presents a list of supported interface languages and prompts the
+        user to select one.  After a selection is made, the corresponding
+        translation table is stored in `$Global:Text` and the language
+        code in `$Global:LangCode`.
+    #>
+    $languageOptions = @(
+        @{ Code = 'fr'; Display = 'FranÃ§ais' },
+        @{ Code = 'en'; Display = 'English' },
+        @{ Code = 'it'; Display = 'Italiano' },
+        @{ Code = 'de'; Display = 'Deutsch' },
+        @{ Code = 'es'; Display = 'EspaÃ±ol' },
+        @{ Code = 'ar'; Display = 'Ø§Ù„Ø¹Ø±Ø¨ÙŠØ©' },
+        @{ Code = 'ru'; Display = 'Ð ÑƒÑÑÐºÐ¸Ð¹' },
+        @{ Code = 'ja'; Display = 'æ—¥æœ¬èªž' },
+        @{ Code = 'zh'; Display = 'ä¸­æ–‡' }
+    )
+    while ($true) {
+        Clear-Host
+        Write-Host "=============================" -ForegroundColor DarkRed
+        Write-Host "        Aegir Multi Tool        " -ForegroundColor DarkRed
+        Write-Host "=============================" -ForegroundColor DarkRed
+        Write-Host "\nSelect a language / SÃ©lectionnez la langue :" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $languageOptions.Count; $i++) {
+            $idx = $i + 1
+            $opt = $languageOptions[$i]
+            Write-Host (" [$idx] {0}" -f $opt.Display) -ForegroundColor White
+        }
+        Write-Host "\n--------------------------------------------"
+        $choice = Get-UserSelection -Items $languageOptions
+        if ($null -eq $choice) { continue }
+        if ($choice -lt 1 -or $choice -gt $languageOptions.Count) { continue }
+        $selectedLang = $languageOptions[$choice - 1].Code
+        $Global:LangCode = $selectedLang
+        if ($Translations.ContainsKey($selectedLang)) { $Global:Text = $Translations[$selectedLang] } else { $Global:Text = $Translations['en'] }
+        return
+    }
+}
+
+function Install-SelectedPackages {
+    <#
+        Installs one or more selected packages.  Accepts an array of
+        numbers (indices) and the master package list.  Each number
+        corresponds to the package's position in the list (1â€‘based).
+        Depending on the Source of the package (Winget, Chocolatey,
+        Manual), the appropriate installation function is invoked.
+    #>
+    param(
+        [Parameter(Mandatory)] [int[]]$Selections,
+        [Parameter(Mandatory)] [array]$Packages
+    )
+    foreach ($sel in $Selections) {
+        if ($sel -eq 0) { return }
+        if ($sel -lt 1 -or $sel -gt $Packages.Count) {
+            Write-Host "NumÃ©ro invalide: $sel" -ForegroundColor Yellow
+            continue
+        }
+        $pkg = $Packages[$sel - 1]
+        switch ($pkg.Source) {
+            'Winget' { Install-Package -Id $pkg.Id -Name $pkg.Name }
+            'Chocolatey' { Install-ChocoPackage -Id $pkg.Id -Name $pkg.Name }
+            'Manual' { Install-ManualPackage -Name $pkg.Name -Url $pkg.Url -FileType $pkg.FileType }
+            default { Write-Host "Source inconnue pour $($pkg.Name)." -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Show-DownloadMenu {
+    <#
+        Displays the download menu listing all available applications.  Each
+        application is numbered starting from 1.  Users can select one or
+        several applications by entering numbers separated by semicolons.
+        The script then installs all selected applications in sequence.
+        A selection of 0 returns the user to the previous menu.
+    #>
+    $packages = @(
+        @{ Name = 'Google Chrome'; Source = 'Winget'; Id = 'Google.Chrome' },
+        @{ Name = 'Discord'; Source = 'Winget'; Id = 'Discord.Discord' },
+        @{ Name = 'Discord Canary'; Source = 'Winget'; Id = 'Discord.Discord.Canary' },
+        @{ Name = 'Discord PTB'; Source = 'Winget'; Id = 'Discord.Discord.PTB' },
+        @{ Name = 'Steam'; Source = 'Winget'; Id = 'Valve.Steam' },
+        @{ Name = 'Bitwarden'; Source = 'Winget'; Id = 'Bitwarden.Bitwarden' },
+        @{ Name = 'NVIDIA GeForce Experience'; Source = 'Winget'; Id = 'Nvidia.GeForceExperience' },
+        @{ Name = 'Microsoft 365 Apps (Office)'; Source = 'Winget'; Id = 'Microsoft.Office' },
+        @{ Name = 'WinRAR'; Source = 'Winget'; Id = 'RARLab.WinRAR' },
+        # RomStation manual downloadã€613864740429352â€ L990-L1006ã€‘
+        @{ Name = 'RomStation'; Source = 'Manual'; Url = 'https://s3.romstation.fr/romstation/application/downloads/2.9.2/romstation-windows-x64.exe'; FileType = 'exe' },
+        @{ Name = 'Epic Games Launcher'; Source = 'Winget'; Id = 'EpicGames.EpicGamesLauncher' },
+        # Riot Games (League of Legends) via WinGetã€391833804172509â€ L34-L35ã€‘
+        @{ Name = 'Riot Games (League of Legends)'; Source = 'Winget'; Id = 'RiotGames.LeagueOfLegends.EUW' },
+        @{ Name = 'OBS Studio'; Source = 'Winget'; Id = 'OBSProject.OBSStudio' },
+        @{ Name = 'Everything (Search)'; Source = 'Winget'; Id = 'voidtools.Everything' },
+        @{ Name = 'Malwarebytes'; Source = 'Winget'; Id = 'Malwarebytes.Malwarebytes' },
+        @{ Name = 'Visual Studio Code'; Source = 'Winget'; Id = 'Microsoft.VisualStudioCode' },
+        @{ Name = 'Notepad++'; Source = 'Winget'; Id = 'Notepad++.Notepad++' },
+        @{ Name = 'Oracle VM VirtualBox'; Source = 'Winget'; Id = 'Oracle.VirtualBox' },
+        # VirtualBox Extension Pack via Chocolatey
+        @{ Name = 'VirtualBox Extension Pack'; Source = 'Chocolatey'; Id = 'virtualbox.extensionpack' },
+        @{ Name = 'Spotify'; Source = 'Winget'; Id = 'Spotify.Spotify' },
+        @{ Name = 'WeMod'; Source = 'Winget'; Id = 'WeMod.WeMod' },
+        # LiveSplit manual downloadã€777711808437881â€ L20-L21ã€‘
+        @{ Name = 'LiveSplit'; Source = 'Manual'; Url = 'https://github.com/LiveSplit/LiveSplit/releases/download/1.8.33/LiveSplit_1.8.33.zip'; FileType = 'zip' },
+        # NightLight Desktop manual downloadã€892926023057950â€ L40-L44ã€‘
+        @{ Name = 'NightLight Desktop'; Source = 'Manual'; Url = 'https://update.nightlight.gg/windows'; FileType = 'exe' },
+        @{ Name = 'Cheat Engine'; Source = 'Chocolatey'; Id = 'cheatengine' },
+        @{ Name = 'Python 3.11'; Source = 'Winget'; Id = 'Python.Python.3.11' }
+    )
+    while ($true) {
+        Clear-Host
+        Write-Host "==============================" -ForegroundColor DarkRed
+        Write-Host ("   {0}   " -f $Text['DownloadMenuTitle']) -ForegroundColor DarkRed
+        Write-Host "==============================" -ForegroundColor DarkRed
+        Write-Host "\n$($Text['SelectMultiple'])" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $packages.Count; $i++) {
+            $index = $i + 1
+            $pkg = $packages[$i]
+            Write-Host (" [$index] {0}" -f $pkg.Name) -ForegroundColor White
+        }
+        Write-Host (" [0] {0}" -f $Text['Back']) -ForegroundColor Yellow
+        Write-Host "\n--------------------------------------------------"
+        $selections = Get-MultiSelection -Items $packages -Prompt $Text['EnterNumbers']
+        if ($selections -contains 0) { return }
+        Install-SelectedPackages -Selections $selections -Packages $packages
+        Write-Host "\n$($Text['InstallComplete'])" -ForegroundColor Cyan
+        [void][System.Console]::ReadKey($true)
+    }
+}
+
+function Show-MainMenu {
+    <#
+        Displays the topâ€‘level menu of the tool.  Currently it only
+        contains the Downloads tab, but more tabs can be added in the
+        future by extending this function.  The main menu loops until
+        the user chooses to quit.
+    #>
+    while ($true) {
+        Clear-Host
+        Write-Host "  ___  _____   ____    _______   _  _______   ______ " -ForegroundColor Red
+        Write-Host " |   \|__  /  |  _ \  |__   __| | ||__   __| |  ____|" -ForegroundColor Red
+        Write-Host " | |) | / /   | |_) |    | |    | |   | |    | |__   " -ForegroundColor Red
+        Write-Host " |  _ < / /   |  _ <     | |    | |   | |    |  __|  " -ForegroundColor Red
+        Write-Host " | |_) / /__  | |_) |    | |    | |   | |    | |____ " -ForegroundColor Red
+        Write-Host " |____/_____| |____/     |_|    |_|   |_|    |______|" -ForegroundColor Red
+        Write-Host "\n$($Text['Welcome'])\n" -ForegroundColor Cyan
+        Write-Host $Text['SelectTab'] -ForegroundColor Cyan
+        Write-Host (" [1] {0}" -f $Text['Downloads']) -ForegroundColor White
+        Write-Host (" [0] {0}" -f $Text['Quit']) -ForegroundColor Yellow
+        Write-Host "--------------------------------------------"
+        $choice = Get-UserSelection -Items 1..1
+        switch ($choice) {
+            1 { Show-DownloadMenu }
+            0 { Write-Host $Text['Goodbye'] -ForegroundColor Green; return }
+            default {
+                if ($Global:Text -and $Global:Text.ContainsKey('InvalidOption')) {
+                    Write-Host $Global:Text['InvalidOption'] -ForegroundColor Yellow
+                } else {
+                    Write-Host "Option invalide. Essayez de nouveau." -ForegroundColor Yellow
+                }
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+}
+
+<#
+    Entry point of the script.  On execution it will selfâ€‘elevate,
+    verify WinGet is available, prompt the user for a language, and then
+    display the main menu.
+#>
+param(
+    [Parameter(ValueFromRemainingArguments=$true)] $Args
+)
+
+$scriptPath = $MyInvocation.MyCommand.Definition
+Self-Elevate -ScriptPath $scriptPath
+
+if (-not (Ensure-WinGet)) { return }
+
+Show-LanguageMenu
+Show-MainMenu
